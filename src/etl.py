@@ -4,18 +4,50 @@ from src.db import engine, init_db
 from src.config import CONF
 from src import betsapi
 
+# Simpler fix for src/etl.py - just be very conservative
+
 def upsert_event(ev, league_id):
-    # FIXED: Only set finals if game is actually finished
+    # CONSERVATIVE: Don't set finals in ETL, let backfill handle it
     final_home, final_away = None, None
     
-    # Check if game is actually finished using proper status validation
-    if ev.get("status") == "finished":  # Your betsapi.py already converts time_status properly
-        if ev.get("ss"):
-            try:
-                a, b = ev["ss"].split("-")
-                final_home, final_away = int(a), int(b)
-            except: 
-                pass
+    # Only set finals if game is very clearly finished AND we're certain
+    if ev.get("status") == "finished" and ev.get("ss"):
+        try:
+            # Only if the start time suggests game should definitely be over
+            start_time_str = ev.get("time", "")
+            if start_time_str:
+                from datetime import datetime, timezone, timedelta
+                
+                # Parse start time
+                try:
+                    if isinstance(start_time_str, (int, float)):
+                        start_time = datetime.utcfromtimestamp(int(start_time_str))
+                    else:
+                        start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                    
+                    if start_time.tzinfo is None:
+                        start_time = start_time.replace(tzinfo=timezone.utc)
+                    
+                    now = datetime.now(timezone.utc)
+                    minutes_since_start = (now - start_time).total_seconds() / 60
+                    
+                    # Only set finals if game started >30 minutes ago (definitely should be done)
+                    if minutes_since_start > 30:
+                        a, b = ev["ss"].split("-")
+                        final_home, final_away = int(a), int(b)
+                    # Otherwise, let backfill_results.py handle it later
+                        
+                except Exception:
+                    # If time parsing fails, don't set finals - be safe
+                    pass
+                    
+        except Exception:
+            # If anything fails, don't set finals
+            pass
+    
+    # For any non-finished status, ensure finals are NULL
+    elif ev.get("status") in ("live", "not_started"):
+        final_home, final_away = None, None
     
     sql = """
     INSERT INTO event(event_id, league_id, start_time_utc, status, home_name, away_name, final_home, final_away)
@@ -24,18 +56,20 @@ def upsert_event(ev, league_id):
       status=excluded.status, start_time_utc=excluded.start_time_utc,
       home_name=excluded.home_name, away_name=excluded.away_name,
       final_home=CASE 
-        WHEN excluded.status='finished' THEN excluded.final_home 
+        WHEN excluded.status='finished' AND excluded.final_home IS NOT NULL THEN excluded.final_home 
+        WHEN excluded.status IN ('live', 'not_started') THEN NULL
         ELSE event.final_home 
       END,
       final_away=CASE 
-        WHEN excluded.status='finished' THEN excluded.final_away 
+        WHEN excluded.status='finished' AND excluded.final_away IS NOT NULL THEN excluded.final_away 
+        WHEN excluded.status IN ('live', 'not_started') THEN NULL
         ELSE event.final_away 
       END;
     """
     with engine.begin() as c:
         c.execute(text(sql), {"id":ev["id"],"lid":league_id,"time":ev["time"],"status":ev["status"],
                               "home":ev["home"],"away":ev["away"],"fh":final_home,"fa":final_away})
-
+        
 def candidates_to_process():
     q = """
     SELECT e.event_id, e.final_home, e.final_away FROM event e

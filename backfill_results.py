@@ -14,7 +14,7 @@ DB = "data/ebasketball.db"
 
 # Tunables
 LOOKBACK_HOURS = int(os.getenv("RESULT_SWEEP_HOURS", "6"))
-MIN_AGE_MIN    = int(os.getenv("RESULT_MIN_AGE_MINUTES", "10"))  # don't touch games started <10m ago
+MIN_AGE_MIN    = int(os.getenv("RESULT_MIN_AGE_MINUTES", "30"))  # don't touch games started <10m ago
 
 def q(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
     with sqlite3.connect(DB) as con:

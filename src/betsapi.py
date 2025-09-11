@@ -72,8 +72,18 @@ def _status_from_time_status(ts: str) -> str:
     """
     BetsAPI convention:
       "0" not started, "1" live, "3" finished
+    Handle missing/empty time_status properly
     """
-    return "not_started" if ts == "0" else ("live" if ts == "1" else ("finished" if ts == "3" else str(ts)))
+    if ts == "0":
+        return "not_started"
+    elif ts == "1":
+        return "live"
+    elif ts == "3":
+        return "finished"
+    else:
+        # For empty, None, or unknown values, default to not_started
+        # This prevents games from being marked as "ended" incorrectly
+        return "not_started"
 
 
 def _normalize_time(t: Any) -> str:
@@ -99,7 +109,13 @@ def _safe_team_name(side: Any) -> str:
 def _normalize_list(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for ev in rows:
-        ts = str(ev.get("time_status", "0"))
+        ts = str(ev.get("time_status", "0"))  # Default to "0" if missing
+        
+        # Only include games that have actual data
+        # Skip games with completely missing/invalid data
+        if not ev.get("id") or not ev.get("home") or not ev.get("away"):
+            continue
+            
         out.append({
             "id": int(ev["id"]),
             "home": _safe_team_name(ev.get("home")),
