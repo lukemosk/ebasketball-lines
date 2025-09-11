@@ -1,0 +1,6 @@
+requests
+python-dotenv
+SQLAlchemy>=2
+pandas
+tenacity
+loguru
