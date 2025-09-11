@@ -5,20 +5,32 @@ from src.config import CONF
 from src import betsapi
 
 def upsert_event(ev, league_id):
+    # FIXED: Only set finals if game is actually finished
     final_home, final_away = None, None
-    if ev.get("ss"):
-        try:
-            a,b = ev["ss"].split("-")
-            final_home, final_away = int(a), int(b)
-        except: pass
+    
+    # Check if game is actually finished using proper status validation
+    if ev.get("status") == "finished":  # Your betsapi.py already converts time_status properly
+        if ev.get("ss"):
+            try:
+                a, b = ev["ss"].split("-")
+                final_home, final_away = int(a), int(b)
+            except: 
+                pass
+    
     sql = """
     INSERT INTO event(event_id, league_id, start_time_utc, status, home_name, away_name, final_home, final_away)
     VALUES (:id, :lid, :time, :status, :home, :away, :fh, :fa)
     ON CONFLICT(event_id) DO UPDATE SET
       status=excluded.status, start_time_utc=excluded.start_time_utc,
       home_name=excluded.home_name, away_name=excluded.away_name,
-      final_home=COALESCE(excluded.final_home, event.final_home),
-      final_away=COALESCE(excluded.final_away, event.final_away);
+      final_home=CASE 
+        WHEN excluded.status='finished' THEN excluded.final_home 
+        ELSE event.final_home 
+      END,
+      final_away=CASE 
+        WHEN excluded.status='finished' THEN excluded.final_away 
+        ELSE event.final_away 
+      END;
     """
     with engine.begin() as c:
         c.execute(text(sql), {"id":ev["id"],"lid":league_id,"time":ev["time"],"status":ev["status"],
@@ -45,7 +57,7 @@ def upsert_opener(event_id, book, market, line, ph, pa, ts):
         c.execute(T(sql), {"eid":event_id,"book":book,"mkt":market,"line":line,"ph":ph,"pa":pa,"ts":ts})
 
 def insert_result(event_id, fh, fa, sp_line, tot_line):
-    spread_delta = abs((fh - fa) - sp_line) if sp_line is not None else None
+    spread_delta = abs(abs(fh - fa) - abs(sp_line)) if sp_line is not None else None  # FIXED: abs(margin - abs(spread))
     total_delta  = abs((fh + fa) - tot_line) if tot_line is not None else None
     def flags(d): return [(d is not None and d <= k) for k in (2,3,4,5)]
     w2s,w3s,w4s,w5s = flags(spread_delta)
@@ -66,16 +78,19 @@ def main():
         for ev in betsapi.list_fixtures(lid):
             upsert_event(ev, lid)
     for row in candidates_to_process():
-        odds = betsapi.get_odds_snapshots(row["event_id"], CONF["book"])
-        sp = odds.get("spread", [])
-        tot = odds.get("total", [])
-        sp_line = sp[0]["line"] if sp else None
-        tot_line = tot[0]["line"] if tot else None
+        # FIXED: Use get_odds_openers instead of non-existent get_odds_snapshots
+        odds = betsapi.get_odds_openers(row["event_id"])
+        sp_line = odds.get("spread") if odds else None
+        tot_line = odds.get("total") if odds else None
+        
         if sp_line is not None:
-            upsert_opener(row["event_id"], CONF["book"], "spread", sp_line, sp[0].get("home_odds"), sp[0].get("away_odds"), sp[0]["update_time"])
+            upsert_opener(row["event_id"], CONF["book"], "spread", sp_line, None, None, odds.get("opened_at_utc", ""))
         if tot_line is not None:
-            upsert_opener(row["event_id"], CONF["book"], "total",  tot_line, tot[0].get("over_odds"), tot[0].get("under_odds"), tot[0]["update_time"])
-        insert_result(row["event_id"], row["final_home"], row["final_away"], sp_line, tot_line)
+            upsert_opener(row["event_id"], CONF["book"], "total", tot_line, None, None, odds.get("opened_at_utc", ""))
+        
+        if sp_line is not None or tot_line is not None:
+            insert_result(row["event_id"], row["final_home"], row["final_away"], sp_line, tot_line)
+    
     logger.info("Cycle complete.")
 
 if __name__ == "__main__":
