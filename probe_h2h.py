@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 TOKEN = os.getenv("BETSAPI_KEY")
 S = requests.Session()
 S.params = {"token": TOKEN}
