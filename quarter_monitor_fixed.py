@@ -1,4 +1,4 @@
-# live_quarter_monitor.py - Monitor live games for quarter endings and capture lines
+# quarter_monitor_fixed.py - Monitor live games for quarter endings and capture lines
 from __future__ import annotations
 import time
 import sqlite3
@@ -14,7 +14,6 @@ from src.config import CONF
 
 DB_PATH = "data/ebasketball.db"
 POLL_INTERVAL = 10  # Check every 10 seconds during live games
-QUARTER_BUFFER = 15  # Seconds buffer around quarter end times
 
 @dataclass
 class GameState:
@@ -25,7 +24,7 @@ class GameState:
     last_poll: datetime
     quarter_lines_captured: set  # Track which quarters we've captured
 
-class LiveQuarterMonitor:
+class QuarterMonitor:
     def __init__(self):
         self.active_games: Dict[int, GameState] = {}
         self.db_path = DB_PATH
@@ -60,8 +59,11 @@ class LiveQuarterMonitor:
                 
                 league_name = league_name.lower()
                 
-                # Check if it's eBasketball
-                if any(keyword in league_name for keyword in ['ebasketball h2h gg league', 'h2h gg league']):
+                # FIXED: Only include H2H GG League, exclude Battle games
+                if ('ebasketball h2h gg league' in league_name and 
+                    '4x5mins' in league_name and 
+                    'battle' not in league_name):
+                    
                     home_name = game.get('home', {})
                     away_name = game.get('away', {})
                     
@@ -74,7 +76,9 @@ class LiveQuarterMonitor:
                         'event_id': game.get('id'),  # FI number
                         'home_name': str(home_name),
                         'away_name': str(away_name),
-                        'league_name': league_name
+                        'league_name': league_name,
+                        'ss': game.get('ss', ''),  # Live score
+                        'time_status': game.get('time_status', '0')  # Live status
                     })
             
             return live_games
@@ -82,54 +86,76 @@ class LiveQuarterMonitor:
         except Exception as e:
             print(f"Error getting live games from API: {e}")
             return []
-        
-    def get_live_games(self) -> List[Dict]:
-        """Get games that should be live based on start time"""
-        with sqlite3.connect(self.db_path) as con:
-            con.row_factory = sqlite3.Row
-            # Games that started 0-30 minutes ago (should be live or recently finished)
-            return con.execute("""
-                SELECT event_id, home_name, away_name, start_time_utc
-                FROM event 
-                WHERE start_time_utc >= datetime('now', '-30 minutes')
-                  AND start_time_utc <= datetime('now', '+2 minutes')
-                  AND (final_home IS NULL OR final_away IS NULL)
-                ORDER BY start_time_utc ASC
-            """).fetchall()
     
-    def parse_game_clock(self, clock_str: str) -> Tuple[int, int, int]:
-        """
-        Parse game clock string to extract quarter and time remaining
-        Expected formats: "2Q 2:30", "3Q 0:05", "4Q 0:00", etc.
-        Returns: (quarter, minutes_remaining, seconds_remaining)
-        """
-        if not clock_str or not isinstance(clock_str, str):
-            return 0, 0, 0
-            
+    def get_live_game_status(self, event_id: int, game_data: Dict) -> Dict:
+        """Get live status using fresh inplay_filter data"""
         try:
-            # Remove extra spaces and convert to uppercase
-            clock = clock_str.strip().upper()
+            score = game_data.get('ss', '')
+            time_status = str(game_data.get('time_status', '0'))
+            is_live = time_status == '1'
             
-            # Extract quarter
-            if 'Q' in clock:
-                quarter_part = clock.split('Q')[0].strip()
-                quarter = int(quarter_part) if quarter_part.isdigit() else 0
-                time_part = clock.split('Q')[1].strip() if 'Q' in clock else ""
-            else:
-                quarter = 0
-                time_part = clock
+            if not is_live:
+                return {
+                    'time_status': time_status,
+                    'score': score,
+                    'is_live': False,
+                    'quarter': 0,
+                    'minutes_remaining': 0,
+                    'seconds_remaining': 0
+                }
             
-            # Extract time remaining (format: "M:SS")
-            if ':' in time_part:
-                time_parts = time_part.split(':')
-                minutes = int(time_parts[0]) if time_parts[0].isdigit() else 0
-                seconds = int(time_parts[1]) if len(time_parts) > 1 and time_parts[1].isdigit() else 0
-            else:
-                minutes = seconds = 0
-                
-            return quarter, minutes, seconds
-        except Exception:
-            return 0, 0, 0
+            # Estimate timing based on score progression
+            try:
+                if '-' in score:
+                    home_score, away_score = map(int, score.split('-'))
+                    total_score = home_score + away_score
+                    
+                    # Rough estimation based on typical scoring
+                    if total_score < 25:
+                        quarter = 1
+                        estimated_elapsed = (total_score / 25) * 300
+                        remaining_seconds = max(0, 300 - int(estimated_elapsed))
+                    elif total_score < 50:
+                        quarter = 2
+                        estimated_elapsed = ((total_score - 25) / 25) * 300
+                        remaining_seconds = max(0, 300 - int(estimated_elapsed))
+                    elif total_score < 75:
+                        quarter = 3
+                        estimated_elapsed = ((total_score - 50) / 25) * 300
+                        remaining_seconds = max(0, 300 - int(estimated_elapsed))
+                    else:
+                        quarter = 4
+                        estimated_elapsed = ((total_score - 75) / 25) * 300
+                        remaining_seconds = max(0, 300 - int(estimated_elapsed))
+                    
+                    remaining_minutes = remaining_seconds // 60
+                    remaining_seconds = remaining_seconds % 60
+                    
+                else:
+                    # Fallback if score parsing fails
+                    quarter = 1
+                    remaining_minutes = 5
+                    remaining_seconds = 0
+                    
+            except:
+                quarter = 1
+                remaining_minutes = 5
+                remaining_seconds = 0
+            
+            return {
+                'time_status': time_status,
+                'score': score,
+                'clock': f"{remaining_minutes}:{remaining_seconds:02d}",
+                'quarter': quarter,
+                'minutes_remaining': remaining_minutes,
+                'seconds_remaining': remaining_seconds,
+                'is_live': is_live,
+                'estimation_note': f'Estimated based on total score: {total_score if "total_score" in locals() else "unknown"}'
+            }
+            
+        except Exception as e:
+            print(f"Error getting live status for {event_id}: {e}")
+            return {}
     
     def is_quarter_ending(self, quarter: int, minutes: int, seconds: int) -> bool:
         """Check if we're at or near a quarter ending"""
@@ -139,88 +165,6 @@ class LiveQuarterMonitor:
         # Consider it quarter ending if 5 seconds or less remaining
         total_seconds = minutes * 60 + seconds
         return total_seconds <= 5
-    
-    def get_live_game_status(self, event_id: int) -> Dict:
-        """Get detailed live status for a game using correct API endpoint"""
-        try:
-            import requests
-            import os
-            
-            token = os.getenv("BETSAPI_KEY")
-            url = f"https://api.b365api.com/v1/bet365/event?FI={event_id}&token={token}&stats=1"
-            
-            response = requests.get(url, timeout=15)
-            if response.status_code != 200:
-                return {}
-            
-            data = response.json()
-            results = data.get('results', [])
-            
-            if not results:
-                return {}
-            
-            # Find the main event data (type='EV')
-            event_data = None
-            if isinstance(results, list):
-                for item in results:
-                    if isinstance(item, dict) and item.get('type') == 'EV':
-                        event_data = item
-                        break
-            
-            if not event_data:
-                return {}
-            
-            # Extract fields based on API documentation
-            score = event_data.get('SS', '')  # SHORT_SCORE
-            time_minutes = event_data.get('TM', 0)  # TMR_MINS (elapsed)
-            time_seconds = event_data.get('TS', 0)  # TMR_SECS (elapsed) 
-            timer_ticking = event_data.get('TT', 0)  # TMR_TICKING
-            
-            # Convert to integers
-            try:
-                minutes_elapsed = int(time_minutes) if time_minutes else 0
-                seconds_elapsed = int(time_seconds) if time_seconds else 0
-                is_ticking = str(timer_ticking) == '1'
-            except:
-                minutes_elapsed = seconds_elapsed = 0
-                is_ticking = False
-            
-            # Calculate quarter and remaining time
-            total_elapsed = minutes_elapsed * 60 + seconds_elapsed
-            
-            if total_elapsed < 300:  # Q1: 0-5 minutes
-                quarter = 1
-                remaining = 300 - total_elapsed
-            elif total_elapsed < 600:  # Q2: 5-10 minutes
-                quarter = 2  
-                remaining = 600 - total_elapsed
-            elif total_elapsed < 900:  # Q3: 10-15 minutes
-                quarter = 3
-                remaining = 900 - total_elapsed
-            elif total_elapsed < 1200:  # Q4: 15-20 minutes
-                quarter = 4
-                remaining = 1200 - total_elapsed
-            else:
-                quarter = 4
-                remaining = 0
-            
-            remaining_minutes = remaining // 60
-            remaining_seconds = remaining % 60
-            
-            return {
-                'time_status': str(timer_ticking),
-                'score': str(score),
-                'clock': f"{remaining_minutes}:{remaining_seconds:02d}",
-                'quarter': quarter,
-                'minutes_remaining': remaining_minutes,
-                'seconds_remaining': remaining_seconds,
-                'is_live': is_ticking,
-                'total_elapsed': total_elapsed
-            }
-            
-        except Exception as e:
-            print(f"Error getting live status for {event_id}: {e}")
-            return {}
     
     def capture_quarter_lines(self, event_id: int, quarter: int) -> bool:
         """Capture the spread lines at quarter end"""
@@ -315,7 +259,7 @@ class LiveQuarterMonitor:
     
     def monitor_cycle(self):
         """Run one monitoring cycle"""
-        # Get live games directly from API instead of database
+        # Get live games with fresh data from inplay_filter
         live_games = self.get_live_games_from_api()
         
         if not live_games:
@@ -328,7 +272,7 @@ class LiveQuarterMonitor:
             event_id = int(game['event_id'])
             
             try:
-                live_status = self.get_live_game_status(event_id)
+                live_status = self.get_live_game_status(event_id, game)
                 
                 if live_status.get('is_live'):
                     if event_id not in self.active_games:
@@ -342,11 +286,12 @@ class LiveQuarterMonitor:
                         captured = len(game_state.quarter_lines_captured)
                         print(f"  FI {event_id}: Q{game_state.quarter} {game_state.time_remaining} | "
                               f"Score: {game_state.score} | Captured: {captured}/3 quarters")
+                else:
+                    # Game not live - remove from tracking if we were monitoring it
+                    if event_id in self.active_games:
+                        print(f"🏁 FI {event_id} no longer live")
+                        del self.active_games[event_id]
                         
-                elif event_id in self.active_games:
-                    print(f"🏁 FI {event_id} no longer live")
-                    del self.active_games[event_id]
-                    
             except Exception as e:
                 print(f"Error monitoring FI {event_id}: {e}")
         
@@ -359,7 +304,7 @@ class LiveQuarterMonitor:
     
     def run(self, cycles: Optional[int] = None):
         """Run the live monitor"""
-        print("🏀 Starting Live Quarter Monitor")
+        print("🏀 Starting Live Quarter Monitor (Fixed Version)")
         print("=" * 50)
         
         cycle_count = 0
@@ -391,7 +336,7 @@ class LiveQuarterMonitor:
                 print(f"    FI {event_id}: {quarters}/3 quarters captured")
 
 def main():
-    monitor = LiveQuarterMonitor()
+    monitor = QuarterMonitor()
     monitor.run()
 
 if __name__ == "__main__":
