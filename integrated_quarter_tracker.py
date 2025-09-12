@@ -8,7 +8,7 @@ import os
 import time
 import sqlite3
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv, find_dotenv
 
 load_dotenv(find_dotenv())
@@ -21,6 +21,30 @@ BOOKMAKER_ID = "bet365"
 QUARTER_LENGTH_SECONDS = 300  # 5 minutes per quarter
 CAPTURE_THRESHOLD_SECONDS = 10  # Capture when ≤10 seconds remain
 TARGET_LEAGUE = "ebasketball h2h gg league"
+
+def ensure_event_exists(fi: str, home: str, away: str) -> None:
+    """Ensure event record exists before capturing lines"""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("""
+                INSERT OR IGNORE INTO event(
+                    event_id, league_id, start_time_utc, status, 
+                    home_name, away_name, final_home, final_away
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                int(fi), 
+                0,  # Default league_id 
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                'live',
+                home,
+                away,
+                None,
+                None
+            ))
+            con.commit()
+    except Exception as e:
+        print(f"  Warning: Could not create event record: {e}")
+
 
 def get_live_h2h_games() -> List[Dict]:
     """Get live eBasketball H2H GG League games"""
@@ -105,9 +129,12 @@ def parse_game_state(raw_data: Dict) -> Optional[Dict]:
         except:
             home_score = away_score = 0
         
-        # Calculate remaining time in current quarter
-        elapsed_in_quarter = minutes * 60 + seconds
-        remaining_seconds = max(0, QUARTER_LENGTH_SECONDS - elapsed_in_quarter)
+        # FIXED: TM and TS are TIME REMAINING, not elapsed!
+        # Convert to remaining seconds directly
+        remaining_seconds = minutes * 60 + seconds
+        
+        # For display/debugging - calculate elapsed time
+        elapsed_in_quarter = QUARTER_LENGTH_SECONDS - remaining_seconds
         
         return {
             'quarter': quarter,
@@ -115,6 +142,7 @@ def parse_game_state(raw_data: Dict) -> Optional[Dict]:
             'seconds': seconds,
             'time_running': time_running,
             'remaining_seconds': remaining_seconds,
+            'elapsed_in_quarter': elapsed_in_quarter,
             'home_score': home_score,
             'away_score': away_score,
             'current_period': current_period
@@ -127,8 +155,16 @@ def parse_game_state(raw_data: Dict) -> Optional[Dict]:
 def is_at_quarter_end(game_state: Dict) -> bool:
     """Check if game is at quarter end and should capture lines"""
     
+    # Only capture Q1-Q3 quarter lines
+    if game_state['quarter'] not in [1, 2, 3]:
+        return False
+    
+    # Capture at 0:00 even if paused (quarter definitely ended)
+    if game_state['remaining_seconds'] == 0:
+        return True
+    
+    # Normal case: ≤10 seconds and clock running
     return (
-        game_state['quarter'] in [1, 2, 3, 4] and  # Valid quarters
         game_state['remaining_seconds'] <= CAPTURE_THRESHOLD_SECONDS and
         game_state['time_running']
     )
@@ -221,6 +257,59 @@ def find_lines_for_game(game_name: str, all_lines: Dict) -> Dict[str, Optional[f
     
     return lines
 
+def should_capture_opener(game_state: Dict) -> bool:
+    """Capture opening line at game start"""
+    # Capture at Q1 5:00 even if paused (game just started)
+    return (
+        game_state['quarter'] == 1 and 
+        game_state['remaining_seconds'] >= 295 and  # 4:55-5:00
+        game_state['remaining_seconds'] <= 300      # At game start
+    )
+
+def store_opener_line(event_id: int, lines: Dict[str, Optional[float]], timing: Dict[str, Any]) -> bool:
+    """Store opening line from live feed"""
+    try:
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        
+        with sqlite3.connect(DB_PATH) as con:
+            if lines['spread'] is not None:
+                con.execute("""
+                    INSERT OR IGNORE INTO opener
+                    (event_id, bookmaker_id, market, line, price_home, price_away, opened_at_utc)
+                    VALUES (?, ?, 'spread', ?, NULL, NULL, ?)
+                """, (
+                    event_id, 
+                    BOOKMAKER_ID, 
+                    lines['spread'],
+                    now_utc
+                ))
+            
+            if lines['total'] is not None:
+                con.execute("""
+                    INSERT OR IGNORE INTO opener
+                    (event_id, bookmaker_id, market, line, price_home, price_away, opened_at_utc)
+                    VALUES (?, ?, 'total', ?, NULL, NULL, ?)
+                """, (
+                    event_id, 
+                    BOOKMAKER_ID, 
+                    lines['total'],
+                    now_utc
+                ))
+            
+            con.commit()
+            return True
+            
+    except Exception as e:
+        print(f"  ❌ Error storing opener line: {e}")
+        return False
+
+def is_game_ending(game_state: Dict) -> bool:
+    """Check if game is ending (Q4/Q5 at 0:00)"""
+    return (
+        game_state['quarter'] in [4, 5] and 
+        game_state['remaining_seconds'] == 0
+    )
+
 def store_quarter_lines(event_id: str, quarter: int, lines: Dict[str, Optional[float]], 
                        game_state: Dict) -> bool:
     """Store captured quarter lines to database"""
@@ -262,6 +351,36 @@ def check_if_already_captured(event_id: str, quarter: int) -> bool:
     except:
         return False
 
+def handle_game_end(event_id: str, game_state: Dict) -> bool:
+    """Handle game end - update final scores and status"""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            # Update event with final scores
+            con.execute("""
+                UPDATE event 
+                SET status = 'finished', 
+                    final_home = ?, 
+                    final_away = ?
+                WHERE event_id = ?
+            """, (
+                game_state['home_score'],
+                game_state['away_score'],
+                int(event_id)
+            ))
+            
+            # Insert result analysis
+            insert_result_analysis(con, int(event_id), 
+                                 game_state['home_score'], 
+                                 game_state['away_score'])
+            
+            con.commit()
+            print(f"  🏁 GAME ENDED - Final: {game_state['home_score']}-{game_state['away_score']}")
+            return True
+            
+    except Exception as e:
+        print(f"  ❌ Error handling game end: {e}")
+        return False
+
 def track_games_once():
     """Single tracking cycle"""
     
@@ -286,6 +405,8 @@ def track_games_once():
         
         print(f"\nFI {fi}: {home} vs {away}")
         
+        ensure_event_exists(fi, home, away)
+
         # Parse game state
         game_state = parse_game_state(game['raw_data'])
         if not game_state:
@@ -306,8 +427,14 @@ def track_games_once():
         game_name = f"{home} vs {away}"
         lines = find_lines_for_game(game_name, all_lines)
         print(f"  Lines: spread={lines['spread']}, total={lines['total']}")
+
+        # Check if game is ending
+        if is_game_ending(game_state):
+            print(f"  🏁 GAME ENDING - CAPTURING FINAL SCORE...")
+            handle_game_end(fi, game_state)
+            continue
         
-        # Check if at quarter end
+        # Check if at quarter end(Q1-Q3 only)
         if is_at_quarter_end(game_state):
             print(f"  🚨 AT QUARTER {quarter} END - CAPTURING LINES...")
             
@@ -324,9 +451,166 @@ def track_games_once():
                     print(f"  ❌ Failed to store lines")
             else:
                 print(f"  ⚠️  No valid betting lines found")
-        
+
+        elif should_capture_opener(game_state):
+            print(f"  📍 GAME START - CAPTURING OPENING LINES...")
+            # Check if we already have an opener
+            with sqlite3.connect(DB_PATH) as con:
+                existing = con.execute("""
+                    SELECT 1 FROM opener 
+                    WHERE event_id = ? AND market = 'spread'
+                    LIMIT 1
+                """, (fi,)).fetchone()
+            
+            if existing:
+                print(f"  ⚠️  Opening lines already captured for this game")
+            else:
+                if lines['spread'] is not None:
+                    if store_opener_line(int(fi), lines, game_state):
+                        print(f"  ✅ Successfully captured opening lines!")
+                    else:
+                        print(f"  ❌ Failed to store opening lines")
+                else:
+                    print(f"  ⚠️  No valid betting lines found")
+
         elif game_state['remaining_seconds'] <= 30:
             print(f"  ⚡ Approaching quarter end ({game_state['remaining_seconds']}s remaining)")
+        
+    check_and_update_finished_games()
+
+def get_adaptive_poll_interval(live_games: List[Dict]) -> int:
+    """Get polling interval based on game states - faster near quarter ends"""
+    
+    if not live_games:
+        return 20  # Default when no games
+    
+    min_remaining = 999
+    closest_game = None
+    
+    # Find the closest quarter end
+    for game in live_games:
+        game_state = parse_game_state(game.get('raw_data', {}))
+        if game_state and game_state['quarter'] in [1, 2, 3, 4, 5]:
+            remaining = game_state['remaining_seconds']
+            if game_state['time_running'] and remaining < min_remaining:
+                min_remaining = remaining
+                closest_game = f"{game['home']} vs {game['away']} Q{game_state['quarter']}"
+    
+    # Adaptive intervals
+    if min_remaining <= 5:
+        interval = 1    # 1 second - CRITICAL ZONE!
+    elif min_remaining <= 10:
+        interval = 2    # 2 seconds - very close
+    elif min_remaining <= 20:
+        interval = 3    # 3 seconds - approaching
+    elif min_remaining <= 30:
+        interval = 5    # 5 seconds - getting close
+    else:
+        interval = 15   # 15 seconds - normal polling
+    
+    # Debug output
+    if min_remaining < 999:
+        print(f"  📊 Closest quarter end: {min_remaining}s remaining ({closest_game})")
+    else:
+        print(f"  📊 No games approaching quarter end")
+    
+    return interval
+
+
+def check_and_update_finished_games():
+    """Check if any tracked games have finished and update their results"""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            
+            # Get games that might be finished (started >20 mins ago, still marked as live)
+            games = con.execute("""
+                SELECT event_id, home_name, away_name 
+                FROM event 
+                WHERE status = 'live' 
+                AND start_time_utc < datetime('now', '-20 minutes')
+                AND final_home IS NULL
+            """).fetchall()
+            
+            if not games:
+                return
+            
+            print(f"\n🔍 Checking {len(games)} games for results...")
+            
+            for game in games:
+                event_id = game['event_id']
+                
+                # Import here to avoid circular import
+                from src.betsapi import get_event_result
+                
+                result = get_event_result(event_id) or {}
+                fh = result.get("final_home")
+                fa = result.get("final_away")
+                
+                if fh is not None and fa is not None:
+                    # Update the event with finals
+                    con.execute("""
+                        UPDATE event 
+                        SET status = 'finished', final_home = ?, final_away = ?
+                        WHERE event_id = ?
+                    """, (int(fh), int(fa), event_id))
+                    
+                    print(f"  ✅ {game['home_name']} vs {game['away_name']}: {fh}-{fa}")
+                    
+                    # Calculate and insert result
+                    insert_result_analysis(con, event_id, int(fh), int(fa))
+            
+            con.commit()
+            
+    except Exception as e:
+        print(f"Error checking results: {e}")
+
+def insert_result_analysis(con, event_id: int, final_home: int, final_away: int):
+    """Insert result analysis for a finished game"""
+    try:
+        # Get opener lines
+        opener = con.execute("""
+            SELECT 
+                MAX(CASE WHEN market='spread' THEN line END) as spread_line,
+                MAX(CASE WHEN market='total' THEN line END) as total_line
+            FROM opener 
+            WHERE event_id = ?
+        """, (event_id,)).fetchone()
+        
+        if not opener:
+            return
+        
+        spread_line = opener['spread_line']
+        total_line = opener['total_line']
+        
+        # Calculate deltas
+        margin = abs(final_home - final_away)
+        total = final_home + final_away
+        
+        spread_delta = abs(margin - abs(spread_line)) if spread_line else None
+        total_delta = abs(total - total_line) if total_line else None
+        
+        # Calculate within flags
+        def within(d, threshold):
+            return 1 if d is not None and d <= threshold else 0
+        
+        # Insert result
+        con.execute("""
+            INSERT OR REPLACE INTO result(
+                event_id, spread_delta, total_delta,
+                within2_spread, within3_spread, within4_spread, within5_spread,
+                within2_total, within3_total, within4_total, within5_total
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            event_id, spread_delta, total_delta,
+            within(spread_delta, 2), within(spread_delta, 3), 
+            within(spread_delta, 4), within(spread_delta, 5),
+            within(total_delta, 2), within(total_delta, 3),
+            within(total_delta, 4), within(total_delta, 5)
+        ))
+        
+    except Exception as e:
+        print(f"Error inserting result analysis: {e}")
 
 def main():
     """Main entry point"""
@@ -335,7 +619,7 @@ def main():
     parser = argparse.ArgumentParser(description="Integrated Quarter Tracker")
     parser.add_argument("--once", action="store_true", help="Run once")
     parser.add_argument("--monitor", action="store_true", help="Continuous monitoring")
-    parser.add_argument("--poll", type=int, default=20, help="Poll interval (seconds)")
+    parser.add_argument("--adaptive", action="store_true", help="Use adaptive polling")
     
     args = parser.parse_args()
     
@@ -343,13 +627,26 @@ def main():
     print("=" * 50)
     
     if args.monitor:
-        print(f"Starting continuous monitoring (polling every {args.poll}s)")
+        if args.adaptive:
+            print("Starting ADAPTIVE monitoring (speeds up near quarter ends)")
+            print("Polling: 1s at <5s | 2s at <10s | 3s at <20s | 5s at <30s | 15s normal")
+        else:
+            print(f"Starting continuous monitoring (fixed 20s polling)")
+        
         print("Press Ctrl+C to stop\n")
         
         try:
             while True:
+                live_games = get_live_h2h_games()
                 track_games_once()
-                time.sleep(args.poll)
+                
+                if args.adaptive and live_games:
+                    interval = get_adaptive_poll_interval(live_games)
+                    print(f"\n⏱️  Next check in {interval}s...")
+                    time.sleep(interval)
+                else:
+                    time.sleep(20)
+                    
         except KeyboardInterrupt:
             print("\nStopping tracker...")
     else:
