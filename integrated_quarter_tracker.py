@@ -5,6 +5,7 @@ Incorporates the proven line extraction method from working_line_extractor.py
 """
 
 import os
+from random import random
 import time
 import sqlite3
 from datetime import datetime, timezone
@@ -21,6 +22,14 @@ BOOKMAKER_ID = "bet365"
 QUARTER_LENGTH_SECONDS = 300  # 5 minutes per quarter
 CAPTURE_THRESHOLD_SECONDS = 10  # Capture when ≤10 seconds remain
 TARGET_LEAGUE = "ebasketball h2h gg league"
+
+def cleanup_wal():
+    """Force SQLite to checkpoint and clean up WAL files"""
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except:
+        pass
 
 def ensure_event_exists(fi: str, home: str, away: str) -> None:
     """Ensure event record exists before capturing lines"""
@@ -478,6 +487,10 @@ def track_games_once():
         
     check_and_update_finished_games()
 
+    import random
+    if random.randint(1, 10) == 1:
+        cleanup_wal()
+
 def get_adaptive_poll_interval(live_games: List[Dict]) -> int:
     """Get polling interval based on game states - faster near quarter ends"""
     
@@ -580,8 +593,9 @@ def insert_result_analysis(con, event_id: int, final_home: int, final_away: int)
         if not opener:
             return
         
-        spread_line = opener['spread_line']
-        total_line = opener['total_line']
+        # Access tuple elements by index, not string keys
+        spread_line = opener[0]  # First column: spread_line
+        total_line = opener[1]   # Second column: total_line
         
         # Calculate deltas
         margin = abs(final_home - final_away)

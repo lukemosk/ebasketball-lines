@@ -4,3 +4,8 @@ SQLAlchemy>=2
 pandas
 tenacity
 loguru
+plotly==5.18.0
+dash==2.14.1
+pandas==2.1.4
+matplotlib==3.8.2
+seaborn==0.13.0
