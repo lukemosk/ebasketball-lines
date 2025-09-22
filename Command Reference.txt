@@ -3,7 +3,7 @@
 ## Main Operations
 
 ### Start Tracking
-python run_integrated_tracker.py          # Main tracker (runs everything)
+python integrated_quarter_tracker.py --monitor --adaptive    # Track openers, quarters,  results
 python live_db_monitor.py                 # Database monitor (separate terminal)
 
 ### Core Analysis

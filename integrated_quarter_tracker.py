@@ -23,6 +23,15 @@ QUARTER_LENGTH_SECONDS = 300  # 5 minutes per quarter
 CAPTURE_THRESHOLD_SECONDS = 10  # Capture when ≤10 seconds remain
 TARGET_LEAGUE = "ebasketball h2h gg league"
 
+NBA_TEAMS = {
+    'hawks', 'celtics', 'nets', 'hornets', 'bulls', 'cavaliers', 'mavericks',
+    'nuggets', 'pistons', 'warriors', 'rockets', 'pacers', 'clippers', 'lakers',
+    'grizzlies', 'heat', 'bucks', 'timberwolves', 'pelicans', 'knicks',
+    'thunder', 'magic', 'sixers', '76ers', 'suns', 'blazers', 'kings',
+    'spurs', 'raptors', 'jazz', 'wizards'
+}
+
+
 def cleanup_wal():
     """Force SQLite to checkpoint and clean up WAL files"""
     try:
@@ -85,6 +94,12 @@ def get_live_h2h_games() -> List[Dict]:
                         # Extract game info
                         game_name = item.get("NA", "")
                         
+                        game_lower = game_name.lower()
+                        has_nba_team = any(team in game_lower for team in NBA_TEAMS)
+
+                        if not has_nba_team:
+                            continue  # Skip non-NBA games
+
                         # Get valid FI (use C2 since C3 is "0" for H2H games)
                         fi = item.get("C2", "") or item.get("C3", "") or item.get("ID", "")
                         
@@ -510,16 +525,12 @@ def get_adaptive_poll_interval(live_games: List[Dict]) -> int:
                 closest_game = f"{game['home']} vs {game['away']} Q{game_state['quarter']}"
     
     # Adaptive intervals
-    if min_remaining <= 5:
-        interval = 1    # 1 second - CRITICAL ZONE!
-    elif min_remaining <= 10:
-        interval = 2    # 2 seconds - very close
-    elif min_remaining <= 20:
-        interval = 3    # 3 seconds - approaching
+    if min_remaining <= 10:
+        interval = 5    # Only check every 5s even at critical time
     elif min_remaining <= 30:
-        interval = 5    # 5 seconds - getting close
+        interval = 15   
     else:
-        interval = 15   # 15 seconds - normal polling
+        interval = 30   # Normal 30s polling
     
     # Debug output
     if min_remaining < 999:
